@@ -91,7 +91,13 @@ class UnoServer:
         ]
 
         logger.info("Command: " + " ".join(cmd))
-        self.libreoffice_process = subprocess.Popen(cmd)
+        # Start LibreOffice process
+        if platform.system() == "Windows":
+            self.libreoffice_process = subprocess.Popen(
+                cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            self.libreoffice_process = subprocess.Popen(cmd, start_new_session=True)
         self.xmlrcp_thread = threading.Thread(None, self.serve)
 
         def signal_handler(signum, frame):
@@ -128,6 +134,38 @@ class UnoServer:
 
         return self.libreoffice_process
 
+    def _safe_terminate_process(self):
+        """安全终止 LibreOffice 进程"""
+        if self.libreoffice_process is None:
+            return
+
+        if self.libreoffice_process.poll() is not None:
+            # Process already terminated
+            self.libreoffice_process = None
+            return
+
+        try:
+            if platform.system() == "Windows":
+                # Windows: 使用 .terminate() 尝试结束主进程（不保证子进程一起结束）
+                self.libreoffice_process.send_signal(signal.CTRL_BREAK_EVENT)
+                self.libreoffice_process.wait(timeout=5)
+            else:
+                # Unix: 终止整个进程组
+                os.killpg(os.getpgid(self.libreoffice_process.pid), signal.SIGTERM)
+                self.libreoffice_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # 如果优雅终止超时，强制杀死进程
+            logger.warning("Process did not terminate gracefully, killing forcefully")
+            try:
+                self.libreoffice_process.kill()
+                self.libreoffice_process.wait(timeout=3)
+            except Exception as e:
+                logger.exception("Force kill failed: %s", e)
+        except Exception as e:
+            logger.exception("Error terminating LibreOffice process: %s", e)
+        finally:
+            self.libreoffice_process = None
+
     def serve(self):
         # Create server
         with XMLRPCServer((self.interface, int(self.port)), allow_none=True) as server:
@@ -156,7 +194,7 @@ class UnoServer:
                 # We ran out of attempts
                 logger.critical("Could not start Libreoffice, exiting.")
                 # Make sure it's really dead
-                self.libreoffice_process.terminate()
+                self._safe_terminate_process()
                 return
 
             logger.info("Starting UnoComparer.")
@@ -184,7 +222,7 @@ class UnoServer:
                 # We ran out of attempts
                 logger.critical("Could not start Libreoffice, exiting.")
                 # Make sure it's really dead
-                self.libreoffice_process.terminate()
+                self._safe_terminate_process()
                 return
 
             self.xmlrcp_server = server
@@ -202,7 +240,7 @@ class UnoServer:
                         self.stop_after,
                     )
                     self.intentional_exit = True
-                    self.libreoffice_process.terminate()
+                    self._safe_terminate_process()
 
             @server.register_function
             def info():
@@ -252,7 +290,7 @@ class UnoServer:
                             "Conversion timeout, terminating conversion and exiting."
                         )
                         self.conv.local_context.dispose()
-                        self.libreoffice_process.terminate()
+                        self._safe_terminate_process()
                         raise
                     else:
                         stop_after()
@@ -289,7 +327,7 @@ class UnoServer:
                         "Comparison timeout, terminating conversion and exiting."
                     )
                     self.conv.local_context.dispose()
-                    self.libreoffice_process.terminate()
+                    self._safe_terminate_process()
                     raise
                 else:
                     stop_after()
@@ -316,13 +354,8 @@ class UnoServer:
         if self.xmlrcp_thread is not None:
             self.xmlrcp_thread.join()
 
-        if self.libreoffice_process and self.libreoffice_process.poll() is not None:
-            self.libreoffice_process.terminate()
-            try:
-                self.libreoffice_process.wait(10)
-            except subprocess.TimeoutExpired:
-                logger.info("Signalling harder...")
-                self.libreoffice_process.terminate()
+        if self.libreoffice_process and self.libreoffice_process.poll() is None:
+            self._safe_terminate_process()
 
 
 def main():
